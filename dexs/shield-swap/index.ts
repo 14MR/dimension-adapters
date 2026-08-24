@@ -33,6 +33,11 @@ const PROTOCOL_FEE_DENOMINATOR = 16n;
 // Pool `fee` is a u16 count of parts per million (200 => 0.02%), same source as above.
 const FEE_PPM_DENOMINATOR = 1_000_000n;
 
+// A swap settles in a separate claim transaction, observed 23-151s after the swap over a 493-claim
+// sample. Half an hour of slack keeps the number of transactions read per run near the number of
+// swaps in the window.
+const CLAIM_LAG_SECONDS = 30 * 60;
+
 // AMM-side ARC-20 token ids, read off the on-chain `pools` mapping. Aleo carries no decimal
 // registry - "The AMM uses native token base units directly. It has no on-chain decimal scale or
 // normalization registry." (https://shield.fi/docs/reference/constants-and-limits) - so decimals and
@@ -167,9 +172,14 @@ const fetch = async (options: FetchOptions) => {
       call.block_timestamp >= options.fromTimestamp &&
       call.block_timestamp < options.toTimestamp
   );
-  // Claims settle a swap and publish the exact filled output and the unspent input. They can land in
-  // a later block than the swap, so every claim the RPC still exposes is read, not just in-window ones.
-  const claimCalls = accepted.filter((call) => call.function_id === CLAIM || call.function_id === CLAIM_NO_REFUND);
+  // Claims settle a swap and publish the exact filled output and the unspent input. A claim always
+  // follows its swap, and never by much, so the window is extended forward rather than read whole.
+  const claimCalls = accepted.filter(
+    (call) =>
+      (call.function_id === CLAIM || call.function_id === CLAIM_NO_REFUND) &&
+      call.block_timestamp >= options.fromTimestamp &&
+      call.block_timestamp < options.toTimestamp + CLAIM_LAG_SECONDS
+  );
 
   const transitions = await getAleoTransactionTransitions([
     ...new Set([...swapCalls, ...claimCalls].map((call) => call.transaction_id)),
