@@ -28,6 +28,18 @@ const MAX_PAGES = 4000;
 // walk over. Ten pages is 500 calls, far more than arrives between two windows of the same run.
 const MAX_HEAD_PAGES = 10;
 
+// `/blocks/transactions` serves at most this many blocks per call, the same cap as snarkOS v4.12's
+// route it mirrors (MAX_BLOCK_TRANSACTIONS_RANGE in node/rest/src/routes.rs).
+const BLOCKS_TRANSACTIONS_RANGE = 160;
+
+// Mainnet genesis block timestamp, the lower bound of every height search.
+const GENESIS_TIMESTAMP = 1725462000;
+
+// A height search interpolates on block time and falls back to bisection, so it needs about
+// log2(height) reads at worst. 64 is beyond that for any u32 height; reaching it means the node's
+// timestamps are not monotonic, which should fail the run.
+const MAX_SEARCH_STEPS = 64;
+
 export interface AleoProgramCall {
   transaction_id: string;
   function_id: string;
@@ -62,6 +74,20 @@ export interface AleoTransition {
   outputs: { type: string; value?: string }[];
 }
 
+/**
+ * A transaction as a block confirmed it. A rejected execution or deployment is replaced by a `fee`
+ * transaction that only carries its fee, so `transaction.fee` is where every fee is, accepted or not.
+ */
+export interface AleoConfirmedTransaction {
+  status: string;
+  type: string;
+  transaction: { type: string; id: string; fee?: { transition: AleoTransition } };
+}
+
+interface RawBlock {
+  header: { metadata: { height: number; timestamp: number } };
+}
+
 /** A timeout or dropped socket (no response at all), rate limiting, or a server-side failure. */
 function isTransient(e: unknown): boolean {
   if (!axios.isAxiosError(e)) return false;
@@ -73,7 +99,7 @@ function isTransient(e: unknown): boolean {
  * The public endpoint sits behind a proxy that intermittently returns 502/522 under load, so each
  * read is retried with a backoff before the error is allowed to fail the run.
  */
-export async function aleoGet(path: string, attempt = 0): Promise<unknown> {
+async function aleoGet(path: string, attempt = 0): Promise<unknown> {
   try {
     // axios rather than fetchURL: fetchURL rejects a falsy body, and `null` is the node's normal
     // answer for a mapping key that has no entry, which is a value here and not a failure.
@@ -222,6 +248,73 @@ export async function getAleoTransactionTransitions(transactionIds: string[]): P
     });
   if (errors.length) throw errors[0];
   return transitions;
+}
+
+async function getAleoBlockTimestamp(height: number): Promise<number> {
+  const block = (await aleoGet(`/block/${height}`)) as RawBlock | null;
+  const timestamp = block?.header?.metadata?.timestamp;
+  if (typeof timestamp !== "number") throw new Error(`aleo: block ${height} has no timestamp`);
+  return timestamp;
+}
+
+/**
+ * Returns the first block height whose timestamp is at or after `timestamp`. Aleo has no lookup by
+ * time, so this searches block timestamps. It throws when the chain has not reached `timestamp`
+ * yet, since the block that would bound the window does not exist.
+ */
+export async function getAleoHeightAtOrAfter(timestamp: number): Promise<number> {
+  if (timestamp <= GENESIS_TIMESTAMP) return 0;
+
+  // Invariant: the block at `lo` is before `timestamp` and the block at `hi` is not.
+  let lo = 0;
+  let loTimestamp = GENESIS_TIMESTAMP;
+  let hi = Number(await aleoGet("/block/height/latest"));
+  let hiTimestamp = await getAleoBlockTimestamp(hi);
+  if (hiTimestamp < timestamp)
+    throw new Error(`aleo: chain has not reached ${timestamp} yet (block ${hi} is at ${hiTimestamp})`);
+
+  let bisect = false;
+  for (let step = 0; hi - lo > 1; step++) {
+    if (step >= MAX_SEARCH_STEPS) throw new Error(`aleo: no block found at ${timestamp} in ${MAX_SEARCH_STEPS} reads`);
+    // Block time is close to constant, so interpolating usually lands within a few blocks. When it
+    // does not halve the range, the next step bisects so the search never degrades below log2.
+    const span = hi - lo;
+    const guess = bisect
+      ? lo + Math.floor(span / 2)
+      : lo + Math.floor(((timestamp - loTimestamp) * span) / Math.max(hiTimestamp - loTimestamp, 1));
+    const height = Math.min(Math.max(guess, lo + 1), hi - 1);
+    const blockTimestamp = await getAleoBlockTimestamp(height);
+    if (blockTimestamp < timestamp) {
+      lo = height;
+      loTimestamp = blockTimestamp;
+    } else {
+      hi = height;
+      hiTimestamp = blockTimestamp;
+    }
+    bisect = hi - lo > span / 2;
+  }
+  return hi;
+}
+
+/** Fetches the confirmed transactions of every block in [startHeight, endHeight), in block order. */
+export async function getAleoBlocksTransactions(startHeight: number, endHeight: number): Promise<AleoConfirmedTransaction[]> {
+  const ranges: [number, number][] = [];
+  for (let start = startHeight; start < endHeight; start += BLOCKS_TRANSACTIONS_RANGE)
+    ranges.push([start, Math.min(start + BLOCKS_TRANSACTIONS_RANGE, endHeight)]);
+
+  const blocks: AleoConfirmedTransaction[][][] = new Array(ranges.length);
+  const { errors } = await PromisePool.withConcurrency(CONCURRENCY)
+    .for(ranges)
+    .process(async ([start, end], index) => {
+      // Without allow_partial the node rejects a range it has not fully indexed, rather than
+      // returning the missing heights as empty blocks.
+      const response = await aleoGet(`/blocks/transactions?start=${start}&end=${end}`);
+      if (!Array.isArray(response) || response.length !== end - start)
+        throw new Error(`aleo: expected ${end - start} blocks of transactions for ${start}..${end}`);
+      blocks[index] = response as AleoConfirmedTransaction[][];
+    });
+  if (errors.length) throw errors[0];
+  return blocks.flat(2);
 }
 
 export type AleoValue = string | AleoValue[] | { [key: string]: AleoValue };

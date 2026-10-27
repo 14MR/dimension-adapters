@@ -1,7 +1,12 @@
 import { FetchOptions, ProtocolType, SimpleAdapter } from "../adapters/types";
 import { CHAIN } from "../helpers/chains";
 import { METRIC } from "../helpers/metrics";
-import { aleoGet } from "../helpers/aleo";
+import {
+  AleoConfirmedTransaction,
+  aleoBigInt,
+  getAleoBlocksTransactions,
+  getAleoHeightAtOrAfter,
+} from "../helpers/aleo";
 
 // Every Aleo transaction pays a base fee plus an optional priority fee, in microcredits.
 // credits.aleo `fee_public`/`fee_private` take both from the payer and credit no one, and snarkVM
@@ -12,46 +17,57 @@ import { aleoGet } from "../helpers/aleo";
 // https://github.com/ProvableHQ/snarkVM/blob/mainnet/ledger/block/src/helpers/target.rs
 const MICROCREDITS_PER_CREDIT = 1e6;
 
-// The explorer indexer writes one row per block, so a window whose last indexed block is further
-// than this from its end has not been fully indexed yet. Aleo targets a block every few seconds.
-const MAX_INDEXER_LAG_SECONDS = 300;
+// Where the base and priority fee sit among each fee function's inputs, as snarkVM reads them
+// (Fee::base_amount / Fee::priority_amount). Both are public inputs even in `fee_private`, whose
+// first input is the private record the fee is paid from.
+// https://github.com/ProvableHQ/snarkVM/blob/mainnet/ledger/block/src/transaction/fee/mod.rs
+const FEE_INPUTS: Record<string, { base: number; priority: number }> = {
+  fee_public: { base: 0, priority: 1 },
+  fee_private: { base: 1, priority: 2 },
+};
 
-interface AleoFees {
-  block_count: number;
-  last_block_timestamp: number | null;
-  burned_fees: string;
-  priority_fees: string;
-}
+function feeAmounts({ transaction }: AleoConfirmedTransaction): { base: bigint; priority: bigint } {
+  const transition = transaction.fee?.transition;
+  // An execution without a fee transition pays nothing, as in Transaction::fee_amount.
+  if (!transition) return { base: 0n, priority: 0n };
 
-function isAleoFees(value: unknown): value is AleoFees {
-  const fees = value as AleoFees;
-  return typeof fees?.block_count === "number"
-    && typeof fees.burned_fees === "string"
-    && typeof fees.priority_fees === "string";
+  const indexes = FEE_INPUTS[transition.function];
+  if (transition.program !== "credits.aleo" || !indexes)
+    throw new Error(`Unexpected fee transition ${transition.program}/${transition.function} in ${transaction.id}`);
+
+  const input = (index: number) => {
+    const value = transition.inputs[index]?.value;
+    if (!value) throw new Error(`Fee transition of ${transaction.id} has no public input ${index}`);
+    return aleoBigInt(value);
+  };
+  return { base: input(indexes.base), priority: input(indexes.priority) };
 }
 
 const fetch = async (options: FetchOptions) => {
-  const { startTimestamp, endTimestamp } = options;
+  // A block belongs to the window its timestamp falls in, so the window is the blocks from the
+  // first at or after its start to the first at or after its end.
+  const [startHeight, endHeight] = await Promise.all([
+    getAleoHeightAtOrAfter(options.startTimestamp),
+    getAleoHeightAtOrAfter(options.endTimestamp),
+  ]);
+  const transactions = await getAleoBlocksTransactions(startHeight, endHeight);
 
-  // Sums the indexer's per-block fee totals over [start, end).
-  // https://docs.provable.com/docs/api/v2/intro
-  const fees = await aleoGet(`/metrics/fees?start=${startTimestamp}&end=${endTimestamp}`);
-  if (!isAleoFees(fees)) throw new Error(`Unexpected /metrics/fees response: ${JSON.stringify(fees)}`);
-
-  if (!fees.block_count || (fees.last_block_timestamp ?? 0) < endTimestamp - MAX_INDEXER_LAG_SECONDS)
-    throw new Error(`Aleo indexer has not reached ${endTimestamp} yet (last indexed block at ${fees.last_block_timestamp})`);
-
-  const burned = Number(fees.burned_fees) / MICROCREDITS_PER_CREDIT;
-  const priority = Number(fees.priority_fees) / MICROCREDITS_PER_CREDIT;
+  let base = 0n;
+  let priority = 0n;
+  for (const transaction of transactions) {
+    const fees = feeAmounts(transaction);
+    base += fees.base;
+    priority += fees.priority;
+  }
 
   const dailyFees = options.createBalances();
   const dailyRevenue = options.createBalances();
   const dailySupplySideRevenue = options.createBalances();
 
-  dailyFees.addCGToken("aleo", burned, METRIC.TRANSACTION_BASE_FEES);
-  dailyFees.addCGToken("aleo", priority, METRIC.TRANSACTION_PRIORITY_FEES);
-  dailyRevenue.addCGToken("aleo", burned, METRIC.TRANSACTION_BASE_FEES);
-  dailySupplySideRevenue.addCGToken("aleo", priority, METRIC.TRANSACTION_PRIORITY_FEES);
+  dailyFees.addCGToken("aleo", Number(base) / MICROCREDITS_PER_CREDIT, METRIC.TRANSACTION_BASE_FEES);
+  dailyFees.addCGToken("aleo", Number(priority) / MICROCREDITS_PER_CREDIT, METRIC.TRANSACTION_PRIORITY_FEES);
+  dailyRevenue.addCGToken("aleo", Number(base) / MICROCREDITS_PER_CREDIT, METRIC.TRANSACTION_BASE_FEES);
+  dailySupplySideRevenue.addCGToken("aleo", Number(priority) / MICROCREDITS_PER_CREDIT, METRIC.TRANSACTION_PRIORITY_FEES);
 
   return { dailyFees, dailyRevenue, dailyHoldersRevenue: dailyRevenue, dailySupplySideRevenue };
 };
